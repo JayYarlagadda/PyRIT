@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
 import random
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, cast
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from transformers import PreTrainedModel, PreTrainedTokenizerBase
+
+    from pyrit.executor.promptgen.gcg.extension_protocols import LossFunction
 
 logger = logging.getLogger(__name__)
 
@@ -559,12 +562,17 @@ class AttackPrompt:
         raise NotImplementedError("Gradient function not yet implemented")
 
     @torch.no_grad()  # type: ignore[misc, untyped-decorator, unused-ignore]
-    def logits(self, model: Any, test_controls: Any = None, return_ids: bool = False) -> Any:
+    def _build_candidate_batch(
+        self,
+        model: Any,
+        test_controls: Any = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
-        Compute logits for one or more candidate controls.
+        Build candidate token ids and their optional padding mask.
 
         Returns:
-            Any: Model logits, optionally paired with their token ids.
+            tuple[torch.Tensor, torch.Tensor | None]: Candidate token ids and
+                an attention mask when string controls require padding.
 
         Raises:
             ValueError: If candidate controls have an invalid type or shape.
@@ -610,14 +618,183 @@ class AttackPrompt:
             self.input_ids.unsqueeze(0).repeat(test_ids.shape[0], 1).to(model.device), 1, locs, test_ids
         )
         attn_mask = (ids != pad_tok).type(ids.dtype) if pad_tok >= 0 else None
+        return ids, attn_mask
+
+    @torch.no_grad()  # type: ignore[misc, untyped-decorator, unused-ignore]
+    def logits(
+        self,
+        model: Any,
+        test_controls: Any = None,
+        return_ids: bool = False,
+        logits_to_keep: torch.Tensor | None = None,
+    ) -> Any:
+        """
+        Compute logits for one or more candidate controls.
+
+        Returns:
+            Any: Model logits, optionally paired with their token ids.
+
+        Raises:
+            ValueError: If candidate controls have an invalid type or shape.
+        """
+        ids, attn_mask = self._build_candidate_batch(model, test_controls)
+
+        model_kwargs: dict[str, Any] = {"input_ids": ids, "attention_mask": attn_mask}
+        if logits_to_keep is not None:
+            model_kwargs["logits_to_keep"] = logits_to_keep
 
         if return_ids:
-            del locs, test_ids
-            return model(input_ids=ids, attention_mask=attn_mask).logits, ids
-        del locs, test_ids
-        logits = model(input_ids=ids, attention_mask=attn_mask).logits
+            return model(**model_kwargs).logits, ids
+        logits = model(**model_kwargs).logits
         del ids
         return logits
+
+    @staticmethod
+    def _expand_prefix_cache(prefix_cache: Any, batch_size: int) -> Any:
+        """
+        Return an independently mutable, batch-expanded view of a model KV cache.
+
+        Returns:
+            Any: A cache whose batch dimension is expanded to ``batch_size``.
+
+        Raises:
+            ValueError: If the source cache contains more than one sequence.
+            TypeError: If the model returned an unsupported cache structure.
+        """
+        if hasattr(prefix_cache, "layers"):
+            expanded_cache = copy(prefix_cache)
+            expanded_layers = []
+            for layer in prefix_cache.layers:
+                expanded_layer = copy(layer)
+                for attribute in ("keys", "values"):
+                    value = getattr(layer, attribute, None)
+                    if isinstance(value, torch.Tensor):
+                        if value.shape[0] != 1:
+                            raise ValueError("Prefix cache must be computed for exactly one sequence")
+                        setattr(expanded_layer, attribute, value.expand(batch_size, *value.shape[1:]))
+                expanded_layers.append(expanded_layer)
+            expanded_cache.layers = expanded_layers
+            return expanded_cache
+
+        if isinstance(prefix_cache, (tuple, list)):
+            return tuple(tuple(value.expand(batch_size, *value.shape[1:]) for value in layer) for layer in prefix_cache)
+
+        raise TypeError(f"Unsupported prefix-cache type: {type(prefix_cache)!r}")
+
+    def _loss_with_prefix_cache(
+        self,
+        model: Any,
+        test_controls: Any,
+        loss_function: Any,
+        logit_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Score candidates after evaluating their invariant prefix once.
+
+        Returns:
+            torch.Tensor: One scalar loss per candidate control.
+        """
+        token_ids, attention_mask = self._build_candidate_batch(model, test_controls)
+        prefix_length = self._control_slice.start - 1
+        prefix_kwargs: dict[str, Any] = {
+            "input_ids": token_ids[:1, :prefix_length],
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if attention_mask is not None:
+            prefix_kwargs["attention_mask"] = attention_mask[:1, :prefix_length]
+        prefix_output = model(**prefix_kwargs)
+        prefix_cache = self._expand_prefix_cache(prefix_output.past_key_values, token_ids.shape[0])
+
+        suffix_kwargs: dict[str, Any] = {
+            "input_ids": token_ids[:, prefix_length:],
+            "past_key_values": prefix_cache,
+            "use_cache": False,
+            "return_dict": True,
+            "logits_to_keep": logit_positions - prefix_length,
+        }
+        if attention_mask is not None:
+            suffix_kwargs["attention_mask"] = attention_mask
+        logits = model(**suffix_kwargs).logits
+        del prefix_output, prefix_cache
+
+        try:
+            result: torch.Tensor = loss_function.compute_loss_from_selected_logits(
+                logits=logits,
+                token_ids=token_ids,
+                target_slice=self._target_slice,
+                control_slice=self._control_slice,
+            )
+            return result
+        finally:
+            del logits, token_ids
+
+    def loss(
+        self,
+        model: Any,
+        test_controls: Any,
+        loss_function: LossFunction,
+        *,
+        use_prefix_cache: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute per-candidate loss without returning full logits from the worker.
+
+        The model forward pass and loss calculation stay in the process that owns
+        the model. Only the batch-sized loss tensor crosses the worker boundary.
+
+        Returns:
+            torch.Tensor: One scalar loss per candidate control.
+        """
+        selective_loss = cast("Any", loss_function)
+        try:
+            forward_parameters = inspect.signature(model.forward).parameters
+        except (TypeError, ValueError):
+            forward_parameters = {}
+
+        supports_selective_logits = "logits_to_keep" in forward_parameters
+        supports_prefix_cache = "past_key_values" in forward_parameters and "use_cache" in forward_parameters
+
+        if supports_selective_logits and hasattr(selective_loss, "get_required_logit_positions"):
+            logit_positions = selective_loss.get_required_logit_positions(
+                target_slice=self._target_slice,
+                control_slice=self._control_slice,
+                device=model.device,
+            )
+            if use_prefix_cache and supports_prefix_cache and self._control_slice.start > 1:
+                return self._loss_with_prefix_cache(
+                    model,
+                    test_controls,
+                    selective_loss,
+                    logit_positions,
+                )
+            logits, token_ids = self.logits(
+                model,
+                test_controls,
+                return_ids=True,
+                logits_to_keep=logit_positions,
+            )
+            try:
+                result: torch.Tensor = selective_loss.compute_loss_from_selected_logits(
+                    logits=logits,
+                    token_ids=token_ids,
+                    target_slice=self._target_slice,
+                    control_slice=self._control_slice,
+                )
+                return result
+            finally:
+                del logits, token_ids
+
+        logits, token_ids = self.logits(model, test_controls, return_ids=True)
+        try:
+            return loss_function.compute_loss(
+                logits=logits,
+                token_ids=token_ids,
+                target_slice=self._target_slice,
+                control_slice=self._control_slice,
+            )
+        finally:
+            del logits, token_ids
 
     def target_loss(self, logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
         """
@@ -2051,6 +2228,7 @@ class ModelWorkerOperation(str, Enum):
 
     GRAD = "grad"
     LOGITS = "logits"
+    LOSS = "loss"
     CONTRAST_LOGITS = "contrast_logits"
     TEST = "test"
     TEST_LOSS = "test_loss"
