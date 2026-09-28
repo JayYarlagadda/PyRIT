@@ -198,13 +198,65 @@ class TestGCGCandidateEvaluatorExecution:
             def __init__(self) -> None:
                 self.keys = torch.zeros(1, 2, 3, 4)
                 self.values = torch.zeros(1, 2, 3, 4)
-                self.conv_states = {0: torch.zeros(1, 2, 3)}
+                self.conv_states = {0: [torch.zeros(1, 2, 3)]}
 
         class Cache:
             layers = [CacheLayer()]
 
         with pytest.raises(TypeError, match="Unsupported state"):
             AttackPrompt._expand_prefix_cache(Cache(), batch_size=2)
+
+    def test_prefix_cache_rejects_layer_without_instance_state(self) -> None:
+        class CacheLayer:
+            __slots__ = ("keys", "values")
+
+            def __init__(self) -> None:
+                self.keys = torch.zeros(1, 2, 3, 4)
+                self.values = torch.zeros(1, 2, 3, 4)
+
+        cache = MagicMock()
+        cache.layers = [CacheLayer()]
+
+        with pytest.raises(TypeError, match="Unsupported prefix-cache layer"):
+            AttackPrompt._expand_prefix_cache(cache, batch_size=2)
+
+    def test_prefix_cache_rejects_non_singleton_batch(self) -> None:
+        layer = MagicMock()
+        layer.keys = torch.zeros(2, 2, 3, 4)
+        layer.values = torch.zeros(2, 2, 3, 4)
+        cache = MagicMock()
+        cache.layers = [layer]
+
+        with pytest.raises(ValueError, match="exactly one sequence"):
+            AttackPrompt._expand_prefix_cache(cache, batch_size=2)
+
+    def test_prefix_cache_expands_legacy_cache(self) -> None:
+        keys = torch.randn(1, 2, 3, 4)
+        values = torch.randn(1, 2, 3, 4)
+
+        expanded = AttackPrompt._expand_prefix_cache(((keys, values),), batch_size=3)
+
+        assert expanded[0][0].shape == (3, 2, 3, 4)
+        assert expanded[0][1].shape == (3, 2, 3, 4)
+        assert torch.equal(expanded[0][0][0], keys[0])
+        assert torch.equal(expanded[0][1][0], values[0])
+
+    @pytest.mark.parametrize(
+        ("cache", "expected_error", "message"),
+        [
+            (((torch.zeros(1, 2), "not-a-tensor"),), TypeError, "Unsupported prefix-cache layer"),
+            (((torch.zeros(2, 2), torch.zeros(2, 2)),), ValueError, "exactly one sequence"),
+            (object(), TypeError, "Unsupported prefix-cache type"),
+        ],
+    )
+    def test_prefix_cache_rejects_unsupported_legacy_cache(
+        self,
+        cache: object,
+        expected_error: type[Exception],
+        message: str,
+    ) -> None:
+        with pytest.raises(expected_error, match=message):
+            AttackPrompt._expand_prefix_cache(cache, batch_size=2)
 
     def test_selective_logits_match_full_logits_on_transformers_model(self) -> None:
         torch.manual_seed(123)
@@ -266,6 +318,8 @@ class TestGCGCandidateEvaluatorExecution:
             target_slice=prompt._target_slice,
             control_slice=prompt._control_slice,
         )
+        attention_mask = torch.ones_like(token_ids)
+        prompt._build_candidate_batch = MagicMock(return_value=(token_ids, attention_mask))
         forward_calls = []
 
         def capture_forward(_module, _args, kwargs, output):
@@ -282,6 +336,11 @@ class TestGCGCandidateEvaluatorExecution:
         prefix_kwargs, prefix_logits_shape = forward_calls[0]
         assert prefix_kwargs["logits_to_keep"] == 1
         assert prefix_logits_shape[1] == 1
+        assert torch.equal(
+            prefix_kwargs["attention_mask"],
+            attention_mask[:1, : prompt._control_slice.start - 1],
+        )
+        assert torch.equal(forward_calls[1][0]["attention_mask"], attention_mask)
 
     def test_hybrid_cache_falls_back_to_uncached_selective_logits(self) -> None:
         torch.manual_seed(123)
@@ -355,6 +414,28 @@ class TestGCGCandidateEvaluatorExecution:
 
         assert torch.equal(actual, expected)
         prompt.logits.assert_called_once_with(model, candidates, return_ids=True)
+
+    def test_attack_prompt_loss_handles_uninspectable_model_forward(self) -> None:
+        logits = torch.randn(2, 6, 10)
+        token_ids = torch.randint(0, 10, (2, 6))
+        prompt = MagicMock()
+        prompt.logits.return_value = (logits, token_ids)
+        prompt._target_slice = slice(3, 5)
+        prompt._control_slice = slice(1, 3)
+        loss_fn = CrossEntropyLoss(target_weight=0.7, control_weight=0.3)
+        model = MagicMock()
+        model.forward = object()
+
+        actual = AttackPrompt.loss(prompt, model, ["cand-1", "cand-2"], loss_fn)
+
+        expected = loss_fn.compute_loss(
+            logits=logits,
+            token_ids=token_ids,
+            target_slice=prompt._target_slice,
+            control_slice=prompt._control_slice,
+        )
+        assert torch.equal(actual, expected)
+        prompt.logits.assert_called_once_with(model, ["cand-1", "cand-2"], return_ids=True)
 
     def test_attack_prompt_worker_loss_selects_only_required_logits_when_supported(self) -> None:
         class SelectiveModel:

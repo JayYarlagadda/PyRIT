@@ -368,6 +368,19 @@ class TestCrossEntropyLoss:
                 control_slice=slice(1, 4),
             )
 
+    def test_selected_logits_reject_corrupted_zero_weight_state(self) -> None:
+        loss_function = CrossEntropyLoss()
+        loss_function._target_weight = 0.0
+        loss_function._control_weight = 0.0
+
+        with pytest.raises(RuntimeError, match="produced no terms"):
+            loss_function.compute_loss_from_selected_logits(
+                logits=torch.empty(2, 0, 20),
+                token_ids=torch.randint(0, 20, (2, 10)),
+                target_slice=slice(5, 8),
+                control_slice=slice(1, 4),
+            )
+
 
 def _make_filter_tokenizer() -> MagicMock:
     """Build a fresh, deterministic, stateless mock tokenizer for filter tests.
