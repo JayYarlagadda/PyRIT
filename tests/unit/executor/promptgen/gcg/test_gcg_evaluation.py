@@ -7,7 +7,7 @@ from dataclasses import FrozenInstanceError
 from unittest.mock import MagicMock
 
 import pytest
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen3NextConfig, Qwen3NextForCausalLM  # type: ignore[ty:possibly-missing-import]
 
 pytest.importorskip(
     "pyrit.executor.promptgen.gcg.attack.base.attack_manager",
@@ -193,6 +193,19 @@ class TestGCGCandidateEvaluatorValidation:
 
 
 class TestGCGCandidateEvaluatorExecution:
+    def test_prefix_cache_rejects_additional_batched_layer_state(self) -> None:
+        class CacheLayer:
+            def __init__(self) -> None:
+                self.keys = torch.zeros(1, 2, 3, 4)
+                self.values = torch.zeros(1, 2, 3, 4)
+                self.conv_states = {0: torch.zeros(1, 2, 3)}
+
+        class Cache:
+            layers = [CacheLayer()]
+
+        with pytest.raises(TypeError, match="Unsupported state"):
+            AttackPrompt._expand_prefix_cache(Cache(), batch_size=2)
+
     def test_selective_logits_match_full_logits_on_transformers_model(self) -> None:
         torch.manual_seed(123)
         model = Qwen2ForCausalLM(
@@ -253,10 +266,73 @@ class TestGCGCandidateEvaluatorExecution:
             target_slice=prompt._target_slice,
             control_slice=prompt._control_slice,
         )
-        actual = prompt.loss(model, candidates, loss_fn, use_prefix_cache=True)
+        forward_calls = []
+
+        def capture_forward(_module, _args, kwargs, output):
+            forward_calls.append((kwargs, output.logits.shape))
+
+        hook = model.register_forward_hook(capture_forward, with_kwargs=True)
+        try:
+            actual = prompt.loss(model, candidates, loss_fn, use_prefix_cache=True)
+        finally:
+            hook.remove()
 
         assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-6)
         assert actual.argmin() == expected.argmin()
+        prefix_kwargs, prefix_logits_shape = forward_calls[0]
+        assert prefix_kwargs["logits_to_keep"] == 1
+        assert prefix_logits_shape[1] == 1
+
+    def test_hybrid_cache_falls_back_to_uncached_selective_logits(self) -> None:
+        torch.manual_seed(123)
+        model = Qwen3NextForCausalLM(
+            Qwen3NextConfig(
+                vocab_size=32,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                max_position_embeddings=32,
+                linear_conv_kernel_dim=4,
+                linear_key_head_dim=8,
+                linear_value_head_dim=8,
+                linear_num_key_heads=2,
+                linear_num_value_heads=2,
+                moe_intermediate_size=16,
+                shared_expert_intermediate_size=16,
+                num_experts_per_tok=1,
+                num_experts=2,
+                layer_types=["linear_attention", "full_attention"],
+            )
+        ).eval()
+        prompt = object.__new__(AttackPrompt)
+        prompt._control_slice = slice(3, 5)
+        prompt._target_slice = slice(6, 9)
+        prompt.input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        prompt.tokenizer = MagicMock()
+        candidates = torch.tensor([[11, 12], [13, 14], [15, 16]])
+        loss_fn = CrossEntropyLoss(target_weight=0.7, control_weight=0.3)
+
+        expected = prompt.loss(model, candidates, loss_fn)
+        forward_calls = []
+
+        def capture_forward(_module, _args, kwargs, _output):
+            forward_calls.append(kwargs)
+
+        hook = model.register_forward_hook(capture_forward, with_kwargs=True)
+        try:
+            actual = prompt.loss(model, candidates, loss_fn, use_prefix_cache=True)
+        finally:
+            hook.remove()
+
+        assert torch.equal(actual, expected)
+        assert len(forward_calls) == 2
+        assert forward_calls[0]["input_ids"].shape[0] == 1
+        assert forward_calls[0]["logits_to_keep"] == 1
+        assert forward_calls[1]["input_ids"].shape[0] == len(candidates)
+        assert "past_key_values" not in forward_calls[1]
 
     def test_attack_prompt_worker_loss_matches_direct_computation(self) -> None:
         logits = torch.randn(2, 6, 10)

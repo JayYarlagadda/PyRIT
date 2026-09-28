@@ -661,23 +661,49 @@ class AttackPrompt:
             ValueError: If the source cache contains more than one sequence.
             TypeError: If the model returned an unsupported cache structure.
         """
+
+        def contains_non_scalar_tensor(value: Any) -> bool:
+            if isinstance(value, torch.Tensor):
+                return value.ndim > 0
+            if isinstance(value, dict):
+                return any(contains_non_scalar_tensor(item) for item in value.values())
+            if isinstance(value, (tuple, list)):
+                return any(contains_non_scalar_tensor(item) for item in value)
+            return False
+
         if hasattr(prefix_cache, "layers"):
             expanded_cache = copy(prefix_cache)
             expanded_layers = []
             for layer in prefix_cache.layers:
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+                if not isinstance(keys, torch.Tensor) or not isinstance(values, torch.Tensor):
+                    raise TypeError(f"Unsupported prefix-cache layer type: {type(layer)!r}")
+                try:
+                    additional_state = (value for name, value in vars(layer).items() if name not in {"keys", "values"})
+                except TypeError as exc:
+                    raise TypeError(f"Unsupported prefix-cache layer type: {type(layer)!r}") from exc
+                if any(contains_non_scalar_tensor(value) for value in additional_state):
+                    raise TypeError(f"Unsupported state in prefix-cache layer type: {type(layer)!r}")
+                if keys.ndim == 0 or values.ndim == 0 or keys.shape[0] != 1 or values.shape[0] != 1:
+                    raise ValueError("Prefix cache must be computed for exactly one sequence")
+
                 expanded_layer = copy(layer)
-                for attribute in ("keys", "values"):
-                    value = getattr(layer, attribute, None)
-                    if isinstance(value, torch.Tensor):
-                        if value.shape[0] != 1:
-                            raise ValueError("Prefix cache must be computed for exactly one sequence")
-                        setattr(expanded_layer, attribute, value.expand(batch_size, *value.shape[1:]))
+                expanded_layer.keys = keys.expand(batch_size, *keys.shape[1:])
+                expanded_layer.values = values.expand(batch_size, *values.shape[1:])
                 expanded_layers.append(expanded_layer)
             expanded_cache.layers = expanded_layers
             return expanded_cache
 
         if isinstance(prefix_cache, (tuple, list)):
-            return tuple(tuple(value.expand(batch_size, *value.shape[1:]) for value in layer) for layer in prefix_cache)
+            expanded_legacy_cache = []
+            for layer in prefix_cache:
+                if not isinstance(layer, (tuple, list)) or not all(isinstance(value, torch.Tensor) for value in layer):
+                    raise TypeError(f"Unsupported prefix-cache layer type: {type(layer)!r}")
+                if any(value.ndim == 0 or value.shape[0] != 1 for value in layer):
+                    raise ValueError("Prefix cache must be computed for exactly one sequence")
+                expanded_legacy_cache.append(tuple(value.expand(batch_size, *value.shape[1:]) for value in layer))
+            return tuple(expanded_legacy_cache)
 
         raise TypeError(f"Unsupported prefix-cache type: {type(prefix_cache)!r}")
 
@@ -687,12 +713,13 @@ class AttackPrompt:
         test_controls: Any,
         loss_function: Any,
         logit_positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """
         Score candidates after evaluating their invariant prefix once.
 
         Returns:
-            torch.Tensor: One scalar loss per candidate control.
+            torch.Tensor | None: One scalar loss per candidate control, or ``None``
+                when the model's cache cannot be safely batch-expanded.
         """
         token_ids, attention_mask = self._build_candidate_batch(model, test_controls)
         prefix_length = self._control_slice.start - 1
@@ -700,11 +727,19 @@ class AttackPrompt:
             "input_ids": token_ids[:1, :prefix_length],
             "use_cache": True,
             "return_dict": True,
+            "logits_to_keep": 1,
         }
         if attention_mask is not None:
             prefix_kwargs["attention_mask"] = attention_mask[:1, :prefix_length]
         prefix_output = model(**prefix_kwargs)
-        prefix_cache = self._expand_prefix_cache(prefix_output.past_key_values, token_ids.shape[0])
+        try:
+            prefix_cache = self._expand_prefix_cache(
+                getattr(prefix_output, "past_key_values", None), token_ids.shape[0]
+            )
+        except (TypeError, ValueError):
+            del prefix_output, token_ids
+            return None
+        del prefix_output
 
         suffix_kwargs: dict[str, Any] = {
             "input_ids": token_ids[:, prefix_length:],
@@ -716,7 +751,7 @@ class AttackPrompt:
         if attention_mask is not None:
             suffix_kwargs["attention_mask"] = attention_mask
         logits = model(**suffix_kwargs).logits
-        del prefix_output, prefix_cache
+        del prefix_cache
 
         try:
             result: torch.Tensor = loss_function.compute_loss_from_selected_logits(
@@ -762,12 +797,14 @@ class AttackPrompt:
                 device=model.device,
             )
             if use_prefix_cache and supports_prefix_cache and self._control_slice.start > 1:
-                return self._loss_with_prefix_cache(
+                cached_loss = self._loss_with_prefix_cache(
                     model,
                     test_controls,
                     selective_loss,
                     logit_positions,
                 )
+                if cached_loss is not None:
+                    return cached_loss
             logits, token_ids = self.logits(
                 model,
                 test_controls,
